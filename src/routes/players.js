@@ -149,7 +149,7 @@ router.get('/:id/performance', validate({ params: uuid }), asyncH(async (req, re
   const playerId = req.params.id;
   await assertCanViewPlayer(req, playerId);
 
-  const [{ rows: [p] }, { rows: journey }, { rows: recent }] = await Promise.all([
+  const [{ rows: [p] }, { rows: journey }, { rows: recent }, { rows: [rank] }] = await Promise.all([
     db.query('SELECT qo_score FROM player_profiles WHERE user_id=$1', [playerId]),
     db.query(
       `SELECT to_char(period, 'Mon') AS label, period, qo_score AS "qoScore", matches_played AS "matchesPlayed", aggregates
@@ -166,11 +166,25 @@ router.get('/:id/performance', validate({ params: uuid }), asyncH(async (req, re
        JOIN teams at ON at.id = m.away_team_id
        WHERE ps.player_id = $1 AND m.status = 'COMPLETED'
        ORDER BY m.scheduled_at DESC LIMIT 10`, [playerId]),
+    // Rank among all players of the leagues this player belongs to
+    db.query(
+      `WITH my_leagues AS (SELECT league_id FROM league_memberships WHERE player_id = $1),
+            peers AS (SELECT DISTINCT lm.player_id, pp.qo_score
+                      FROM league_memberships lm
+                      JOIN player_profiles pp ON pp.user_id = lm.player_id
+                      WHERE lm.league_id IN (SELECT league_id FROM my_leagues))
+       SELECT (SELECT COUNT(*) + 1 FROM peers
+               WHERE qo_score > (SELECT qo_score FROM player_profiles WHERE user_id = $1)) AS position,
+              (SELECT COUNT(*) FROM peers) AS total`, [playerId]),
   ]);
   if (!p) throw ApiError.notFound('Player not found');
 
+  const totalPeers = Number(rank?.total || 0);
   ok(res, {
     qoScore: p.qo_score,
+    ranking: totalPeers > 0
+      ? { position: Number(rank.position), totalPlayers: totalPeers }
+      : null,
     qoJourney: journey,          // [{label:'Jan', qoScore: 640, ...}]
     recentMatches: recent.map((r) => ({
       id: r.id,
@@ -186,6 +200,61 @@ router.get('/:id/performance', validate({ params: uuid }), asyncH(async (req, re
 }));
 
 // ---------------------------------------------------------------- GET /players/search  (coach: select-players screen)
+// ---------------------------------------------------------------- GET /players/discover
+// Leaderboard-style discovery for the Dugout screen. Any authenticated user.
+// Only players who keep their profile public are listed.
+router.get('/discover', asyncH(async (req, res) => {
+  const { limit, offset, page } = pagination(req);
+  const sport = (req.query.sport || '').trim();
+  const q = (req.query.q || '').trim();
+  const params = [];
+  let where = `(pp.settings->>'publicProfile')::boolean IS DISTINCT FROM false`;
+  if (sport) {
+    params.push(sport);
+    where += ` AND s.name ILIKE $${params.length}`;
+  }
+  if (q) {
+    params.push(`%${q}%`);
+    where += ` AND (pp.full_name ILIKE $${params.length} OR pp.player_code ILIKE $${params.length})`;
+  }
+  params.push(limit, offset);
+
+  const { rows } = await db.query(
+    `SELECT pp.user_id AS id, pp.full_name AS "fullName", pp.player_code AS "playerCode",
+            pp.qo_score AS "qoScore", pp.school_academy AS academy, pp.location,
+            pp.avatar_key, u.is_verified AS verified,
+            s.name AS sport, s.emoji AS "sportEmoji",
+            (SELECT COUNT(*) FROM follows f WHERE f.followee_id = pp.user_id) AS followers,
+            (SELECT COUNT(*) FROM player_stats ps WHERE ps.player_id = pp.user_id) AS "matchesPlayed",
+            COUNT(*) OVER() AS total
+     FROM player_profiles pp
+     JOIN users u ON u.id = pp.user_id
+     LEFT JOIN sports s ON s.id = pp.primary_sport_id
+     WHERE ${where}
+     ORDER BY pp.qo_score DESC, pp.full_name ASC
+     LIMIT $${params.length - 1} OFFSET $${params.length}`, params);
+
+  const total = rows.length ? Number(rows[0].total) : 0;
+  const data = [];
+  for (const r of rows) {
+    data.push({
+      id: r.id,
+      fullName: r.fullName,
+      playerCode: r.playerCode,
+      qoScore: r.qoScore,
+      academy: r.academy,
+      location: r.location,
+      avatarUrl: await storage.publicUrl(r.avatar_key),
+      verified: r.verified,
+      sport: r.sport,
+      sportEmoji: r.sportEmoji,
+      followers: Number(r.followers),
+      matchesPlayed: Number(r.matchesPlayed),
+    });
+  }
+  ok(res, data, pageMeta(page, limit, total));
+}));
+
 router.get('/', requireRole('COACH'), asyncH(async (req, res) => {
   const { limit, offset, page } = pagination(req);
   const q = (req.query.q || '').trim();
@@ -195,20 +264,56 @@ router.get('/', requireRole('COACH'), asyncH(async (req, res) => {
   params.push(limit, offset);
 
   const { rows } = await db.query(
-    `SELECT DISTINCT pp.user_id AS id, pp.player_code AS "playerId", pp.full_name AS "fullName",
-            pp.qo_score AS "qoScore", pp.avatar_key, COUNT(*) OVER() AS total
+    `SELECT DISTINCT ON (pp.user_id)
+            pp.user_id AS id, pp.player_code AS "playerId", pp.full_name AS "fullName",
+            pp.qo_score AS "qoScore", pp.avatar_key,
+            s.emoji AS "sportEmoji", s.name AS "sportName",
+            t.name AS "teamName", trm.position, trm.status AS roster_status,
+            lm.joined_at AS "joinedAt",
+            EXISTS(SELECT 1 FROM follows f WHERE f.follower_id = $1 AND f.followee_id = pp.user_id) AS "isFollowing",
+            (SELECT COUNT(*) FROM follows f2 WHERE f2.followee_id = pp.user_id) AS followers,
+            COUNT(*) OVER() AS total
      FROM player_profiles pp
      JOIN league_memberships lm ON lm.player_id = pp.user_id
      JOIN leagues l ON l.id = lm.league_id
+     LEFT JOIN sports s ON s.id = pp.primary_sport_id
+     LEFT JOIN team_roster_memberships trm
+            ON trm.player_id = pp.user_id AND trm.status = 'ACTIVE'
+     LEFT JOIN teams t ON t.id = trm.team_id AND t.league_id = lm.league_id
      WHERE ${where}
-     ORDER BY pp.full_name
+     ORDER BY pp.user_id, t.name NULLS LAST
      LIMIT $${params.length - 1} OFFSET $${params.length}`, params);
 
   const data = await Promise.all(rows.map(async (r) => ({
     id: r.id, playerId: r.playerId, fullName: r.fullName, qoScore: r.qoScore,
     avatarUrl: await storage.publicUrl(r.avatar_key),
+    sportEmoji: r.sportEmoji, sportName: r.sportName,
+    teamName: r.teamName, position: r.position,
+    onTeam: r.roster_status === 'ACTIVE',
+    isFollowing: r.isFollowing === true,
+    followers: Number(r.followers || 0),
+    joinedAt: r.joinedAt,
   })));
   ok(res, data, pageMeta(page, limit, rows[0]?.total || 0));
+}));
+
+
+// ---------------------------------------------------------------- POST /players/:id/follow
+router.post('/:id/follow', validate({ params: uuid }), asyncH(async (req, res) => {
+  const targetId = req.params.id;
+  if (targetId === req.user.id) throw ApiError.badRequest('You cannot follow yourself');
+  const { rowCount } = await db.query('SELECT 1 FROM player_profiles WHERE user_id=$1', [targetId]);
+  if (!rowCount) throw ApiError.notFound('Player not found');
+  await db.query(
+    `INSERT INTO follows (follower_id, followee_id) VALUES ($1,$2)
+     ON CONFLICT (follower_id, followee_id) DO NOTHING`, [req.user.id, targetId]);
+  ok(res, { following: true });
+}));
+
+// ---------------------------------------------------------------- DELETE /players/:id/follow
+router.delete('/:id/follow', validate({ params: uuid }), asyncH(async (req, res) => {
+  await db.query('DELETE FROM follows WHERE follower_id=$1 AND followee_id=$2', [req.user.id, req.params.id]);
+  ok(res, { following: false });
 }));
 
 module.exports = router;

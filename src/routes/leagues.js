@@ -189,6 +189,49 @@ router.get('/:id/teams', validate({ params: uuid }), asyncH(async (req, res) => 
   }))));
 }));
 
+// ---------------------------------------------------------------- GET /leagues/:id/standings
+router.get('/:id/standings', validate({ params: uuid }), asyncH(async (req, res) => {
+  const { rows: [l] } = await db.query('SELECT id, owner_coach_id FROM leagues WHERE id=$1', [req.params.id]);
+  if (!l) throw ApiError.notFound('League not found');
+  if (req.user.role === 'COACH' && l.owner_coach_id !== req.user.id) throw ApiError.forbidden();
+  if (req.user.role === 'PLAYER') {
+    const { rowCount } = await db.query('SELECT 1 FROM league_memberships WHERE league_id=$1 AND player_id=$2', [l.id, req.user.id]);
+    if (!rowCount) throw ApiError.forbidden('Join this league to view it');
+  }
+
+  const { rows } = await db.query(
+    `SELECT t.id, t.name, t.icon_emoji, t.logo_key,
+            COUNT(m.id) AS played,
+            COUNT(m.id) FILTER (WHERE m.winner_team_id = t.id) AS wins,
+            COUNT(m.id) FILTER (WHERE m.winner_team_id IS NOT NULL AND m.winner_team_id <> t.id) AS losses,
+            COUNT(m.id) FILTER (WHERE m.winner_team_id IS NULL) AS draws
+     FROM teams t
+     LEFT JOIN matches m ON m.league_id = t.league_id AND m.status = 'COMPLETED'
+                        AND (m.home_team_id = t.id OR m.away_team_id = t.id)
+     WHERE t.league_id = $1
+     GROUP BY t.id
+     ORDER BY (COUNT(m.id) FILTER (WHERE m.winner_team_id = t.id)) DESC, t.name ASC`,
+    [req.params.id]);
+
+  const data = [];
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    data.push({
+      rank: i + 1,
+      teamId: r.id,
+      name: r.name,
+      icon: r.icon_emoji,
+      logoUrl: await storage.publicUrl(r.logo_key),
+      played: Number(r.played),
+      wins: Number(r.wins),
+      losses: Number(r.losses),
+      draws: Number(r.draws),
+      points: Number(r.wins) * 2 + Number(r.draws),
+    });
+  }
+  ok(res, data);
+}));
+
 // ---------------------------------------------------------------- code management (coach, owner only)
 // GET /leagues/:id/code — current active code
 router.get('/:id/code', requireRole('COACH'), validate({ params: uuid }), asyncH(async (req, res) => {

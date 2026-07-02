@@ -31,7 +31,8 @@ router.get('/dashboard', asyncH(async (req, res) => {
          (SELECT COUNT(*) FROM leagues WHERE owner_coach_id=$1) AS leagues,
          (SELECT COUNT(DISTINCT lm.player_id) FROM league_memberships lm
             JOIN leagues l ON l.id=lm.league_id WHERE l.owner_coach_id=$1) AS players,
-         (SELECT COUNT(*) FROM notifications WHERE user_id=$1 AND NOT is_read) AS unread`, [coachId]),
+         (SELECT COUNT(*) FROM notifications WHERE user_id=$1 AND NOT is_read) AS unread,
+         (SELECT COUNT(*) FROM recommendations WHERE from_coach_id=$1) AS recommendations`, [coachId]),
   ]);
 
   ok(res, {
@@ -49,6 +50,7 @@ router.get('/dashboard', asyncH(async (req, res) => {
       leagues: Number(counts.leagues),
       players: Number(counts.players),
       unreadNotifications: Number(counts.unread),
+      recommendations: Number(counts.recommendations),
     },
     leagues: await Promise.all(leagues.map(async (l) => ({
       id: l.id, name: l.name, icon: l.icon, status: l.status, gender: l.gender,

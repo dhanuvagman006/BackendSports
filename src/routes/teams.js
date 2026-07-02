@@ -108,6 +108,44 @@ router.post('/:id/players', requireRole('COACH'), validate({
   created(res, { membershipId: m.id });
 }));
 
+// ---------------------------------------------------------------- POST /teams/:id/join (player self-join)
+// A player who has already joined the league picks their team.
+router.post('/:id/join', requireRole('PLAYER'), validate({ params: uuid }), asyncH(async (req, res) => {
+  const team = await loadTeam(req.params.id);
+
+  const { rowCount: inLeague } = await db.query(
+    'SELECT 1 FROM league_memberships WHERE league_id=$1 AND player_id=$2', [team.league_id, req.user.id]);
+  if (!inLeague) throw ApiError.forbidden('Join this league before picking a team');
+
+  const { rows: [existing] } = await db.query(
+    `SELECT trm.team_id, t.name FROM team_roster_memberships trm
+     JOIN teams t ON t.id = trm.team_id
+     WHERE trm.player_id = $1 AND t.league_id = $2 AND trm.status = 'ACTIVE'`,
+    [req.user.id, team.league_id]);
+  if (existing) {
+    if (existing.team_id === team.id) {
+      return ok(res, { joined: true, team: { id: team.id, name: team.name } });
+    }
+    throw ApiError.conflict(`You are already on ${existing.name} in this league`);
+  }
+
+  await db.query(
+    `INSERT INTO team_roster_memberships (team_id, player_id)
+     VALUES ($1,$2)
+     ON CONFLICT (team_id, player_id) DO UPDATE SET status='ACTIVE'`,
+    [team.id, req.user.id]);
+
+  await db.query(
+    `INSERT INTO notifications (user_id, type, title, body, emoji, data)
+     SELECT l.owner_coach_id, 'LEAGUE_UPDATE', 'Player picked a team',
+            pp.full_name || ' joined ' || t.name, '👥',
+            jsonb_build_object('teamId', t.id, 'playerId', pp.user_id)
+     FROM teams t JOIN leagues l ON l.id = t.league_id, player_profiles pp
+     WHERE t.id = $1 AND pp.user_id = $2::uuid`, [team.id, req.user.id]);
+
+  created(res, { joined: true, team: { id: team.id, name: team.name } });
+}));
+
 // ---------------------------------------------------------------- PATCH /teams/:id/players/:playerId/stats (coach)
 // Upserts a per-match stat line and applies the Qo delta to the player's profile.
 router.patch('/:id/players/:playerId/stats', requireRole('COACH'), validate({

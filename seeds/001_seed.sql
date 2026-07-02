@@ -102,9 +102,11 @@ INSERT INTO team_roster_memberships (team_id, player_id, jersey_no, position, is
 INSERT INTO matches (league_id, home_team_id, away_team_id, scheduled_at, venue, status, home_score, away_score, result_summary)
 VALUES (league_id, t_falcons, t_thunder, now() - interval '10 days', 'Falcons Ground, Bangalore', 'COMPLETED',
         '164/6', '140/9', 'Falcons FC won by 24 runs') RETURNING id INTO m_past;
+UPDATE matches SET winner_team_id = t_falcons WHERE id = m_past;
 INSERT INTO matches (league_id, home_team_id, away_team_id, scheduled_at, venue, status, home_score, away_score, result_summary)
 VALUES (league_id, t_royal, t_falcons, now() - interval '4 days', 'City Stadium, Bangalore', 'COMPLETED',
         '152/8', '155/5', 'Falcons FC won by 5 wickets') RETURNING id INTO m_past2;
+UPDATE matches SET winner_team_id = t_falcons WHERE id = m_past2;
 INSERT INTO matches (league_id, home_team_id, away_team_id, scheduled_at, venue)
 VALUES (league_id, t_alpha, t_thunder, now() + interval '3 days', 'Falcons Ground, Bangalore') RETURNING id INTO m_next;
 INSERT INTO matches (league_id, home_team_id, away_team_id, scheduled_at, venue)

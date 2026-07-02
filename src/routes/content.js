@@ -107,6 +107,51 @@ dugout.get('/', asyncH(async (req, res) => {
 }));
 
 // GET /dugout/:id/messages?page=&limit=
+
+// POST /dugout/direct — find or create a 1:1 thread with another user.
+// Allowed when the two users share a league (coach owns it / both are members).
+dugout.post('/direct', validate({
+  body: z.object({ userId: z.string().uuid() }),
+}), asyncH(async (req, res) => {
+  const otherId = req.body.userId;
+  if (otherId === req.user.id) throw ApiError.badRequest('Cannot message yourself');
+
+  const { rowCount: related } = await db.query(
+    `SELECT 1
+     FROM league_memberships lm
+     JOIN leagues l ON l.id = lm.league_id
+     WHERE (lm.player_id = $1 AND (l.owner_coach_id = $2 OR EXISTS
+             (SELECT 1 FROM league_memberships x WHERE x.league_id = l.id AND x.player_id = $2)))
+        OR (lm.player_id = $2 AND (l.owner_coach_id = $1 OR EXISTS
+             (SELECT 1 FROM league_memberships y WHERE y.league_id = l.id AND y.player_id = $1)))
+     LIMIT 1`, [req.user.id, otherId]);
+  if (!related) throw ApiError.forbidden('You can only message people in your leagues');
+
+  const { rows: [existing] } = await db.query(
+    `SELECT ct.id FROM chat_threads ct
+     JOIN chat_participants a ON a.thread_id = ct.id AND a.user_id = $1
+     JOIN chat_participants b ON b.thread_id = ct.id AND b.user_id = $2
+     WHERE ct.scope = 'DIRECT' LIMIT 1`, [req.user.id, otherId]);
+  if (existing) return ok(res, { threadId: existing.id });
+
+  const threadId = await db.tx(async (client) => {
+    const { rows: [other] } = await client.query(
+      `SELECT COALESCE(pp.full_name, cp2.full_name) AS name
+       FROM users u
+       LEFT JOIN player_profiles pp ON pp.user_id = u.id
+       LEFT JOIN coach_profiles cp2 ON cp2.user_id = u.id
+       WHERE u.id = $1`, [otherId]);
+    const { rows: [ct] } = await client.query(
+      `INSERT INTO chat_threads (scope, title) VALUES ('DIRECT', $1) RETURNING id`,
+      [other?.name || 'Direct message']);
+    await client.query(
+      'INSERT INTO chat_participants (thread_id, user_id) VALUES ($1,$2), ($1,$3)',
+      [ct.id, req.user.id, otherId]);
+    return ct.id;
+  });
+  created(res, { threadId });
+}));
+
 dugout.get('/:id/messages', validate({ params: z.object({ id: z.string().uuid() }) }), asyncH(async (req, res) => {
   const { rowCount: member } = await db.query(
     'SELECT 1 FROM chat_participants WHERE thread_id=$1 AND user_id=$2', [req.params.id, req.user.id]);
@@ -187,6 +232,7 @@ matches.get('/', asyncH(async (req, res) => {
   const { rows } = await db.query(
     `SELECT m.id, m.scheduled_at AS "scheduledAt", m.status, m.venue,
             m.home_score AS "homeScore", m.away_score AS "awayScore", m.result_summary AS "resultSummary",
+            m.winner_team_id AS "winnerTeamId",
             jsonb_build_object('id', ht.id, 'name', ht.name, 'icon', ht.icon_emoji) AS "homeTeam",
             jsonb_build_object('id', at.id, 'name', at.name, 'icon', at.icon_emoji) AS "awayTeam",
             l.name AS "leagueName", COUNT(*) OVER() AS total
@@ -217,6 +263,62 @@ matches.post('/', requireRole('COACH'), validate({
      VALUES ($1,$2,$3,$4,$5) RETURNING id, scheduled_at AS "scheduledAt", status, venue`,
     [b.leagueId, b.homeTeamId, b.awayTeamId, b.scheduledAt, b.venue || null]);
   created(res, row);
+}));
+
+// GET /matches/:id/stats?teamId= — existing stat lines for a match (prefills the coach edit table)
+matches.get('/:id/stats', requireRole('COACH'), validate({
+  params: z.object({ id: z.string().uuid() }),
+}), asyncH(async (req, res) => {
+  const { rows: [m] } = await db.query(
+    `SELECT m.id, l.owner_coach_id FROM matches m JOIN leagues l ON l.id = m.league_id WHERE m.id=$1`,
+    [req.params.id]);
+  if (!m) throw ApiError.notFound('Match not found');
+  if (m.owner_coach_id !== req.user.id) throw ApiError.forbidden('Not your league');
+
+  const params = [req.params.id];
+  let teamFilter = '';
+  if (req.query.teamId) {
+    params.push(req.query.teamId);
+    teamFilter = 'AND ps.team_id = $2';
+  }
+  const { rows } = await db.query(
+    `SELECT ps.player_id AS "playerId", ps.team_id AS "teamId", ps.stats,
+            ps.qo_points AS "qoPoints", ps.rating,
+            pp.full_name AS "fullName", pp.player_code AS "playerCode"
+     FROM player_stats ps
+     JOIN player_profiles pp ON pp.user_id = ps.player_id
+     WHERE ps.match_id = $1 ${teamFilter}`, params);
+  ok(res, rows);
+}));
+
+// PATCH /matches/:id/result (coach records the outcome — feeds league standings)
+matches.patch('/:id/result', requireRole('COACH'), validate({
+  params: z.object({ id: z.string().uuid() }),
+  body: z.object({
+    homeScore: z.string().max(30),
+    awayScore: z.string().max(30),
+    winnerTeamId: z.string().uuid().nullable().optional(), // null/omitted => draw
+    resultSummary: z.string().max(160).optional(),
+    status: z.enum(['LIVE', 'COMPLETED']).default('COMPLETED'),
+  }),
+}), asyncH(async (req, res) => {
+  const { rows: [m] } = await db.query(
+    `SELECT m.id, m.home_team_id, m.away_team_id, l.owner_coach_id
+     FROM matches m JOIN leagues l ON l.id = m.league_id WHERE m.id=$1`, [req.params.id]);
+  if (!m) throw ApiError.notFound('Match not found');
+  if (m.owner_coach_id !== req.user.id) throw ApiError.forbidden('Not your league');
+  const w = req.body.winnerTeamId ?? null;
+  if (w && w !== m.home_team_id && w !== m.away_team_id) {
+    throw ApiError.badRequest('winnerTeamId must be one of the two teams in this match');
+  }
+  const { rows: [row] } = await db.query(
+    `UPDATE matches SET home_score=$2, away_score=$3, winner_team_id=$4,
+            result_summary=COALESCE($5, result_summary), status=$6
+     WHERE id=$1
+     RETURNING id, status, home_score AS "homeScore", away_score AS "awayScore",
+               winner_team_id AS "winnerTeamId", result_summary AS "resultSummary"`,
+    [req.params.id, req.body.homeScore, req.body.awayScore, w, req.body.resultSummary || null, req.body.status]);
+  ok(res, row);
 }));
 
 module.exports = { playbook, dugout, notifications, matches };
