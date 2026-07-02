@@ -1,0 +1,214 @@
+const express = require('express');
+const { z } = require('zod');
+const db = require('../config/db');
+const storage = require('../services/storage');
+const { ok, asyncH, ApiError, pagination, pageMeta } = require('../utils/http');
+const { authenticate, requireRole, validate } = require('../middleware');
+
+const router = express.Router();
+router.use(authenticate);
+
+const uuid = z.object({ id: z.string().uuid() });
+
+/** Players may only read their own aggregate screens; coaches may read players in their leagues. */
+async function assertCanViewPlayer(req, playerId) {
+  if (req.user.role === 'PLAYER') {
+    if (req.user.id !== playerId) throw ApiError.forbidden();
+    return;
+  }
+  const { rowCount } = await db.query(
+    `SELECT 1 FROM league_memberships lm
+     JOIN leagues l ON l.id = lm.league_id
+     WHERE lm.player_id = $1 AND l.owner_coach_id = $2 LIMIT 1`,
+    [playerId, req.user.id],
+  );
+  if (!rowCount) throw ApiError.forbidden('This player is not in any of your leagues');
+}
+
+// ---------------------------------------------------------------- GET /players/:id/home
+router.get('/:id/home', validate({ params: uuid }), asyncH(async (req, res) => {
+  const playerId = req.params.id;
+  await assertCanViewPlayer(req, playerId);
+
+  const [{ rows: [p] }, { rows: [membership] }, { rows: [nextMatch] }, { rows: notifications }, { rows: [counts] }] =
+    await Promise.all([
+      db.query(
+        `SELECT pp.player_code, pp.full_name, pp.qo_score, pp.avatar_key,
+                s.id AS sport_id, s.name AS sport_name, s.emoji AS sport_emoji
+         FROM player_profiles pp LEFT JOIN sports s ON s.id = pp.primary_sport_id
+         WHERE pp.user_id = $1`, [playerId]),
+      db.query(
+        `SELECT l.id AS league_id, l.name AS league_name, l.icon_emoji, l.logo_key, l.gender, l.season,
+                t.id AS team_id, t.name AS team_name, t.icon_emoji AS team_emoji
+         FROM league_memberships lm
+         JOIN leagues l ON l.id = lm.league_id AND l.status = 'ACTIVE'
+         LEFT JOIN team_roster_memberships trm
+                ON trm.player_id = lm.player_id AND trm.status = 'ACTIVE'
+         LEFT JOIN teams t ON t.id = trm.team_id AND t.league_id = l.id
+         WHERE lm.player_id = $1
+         ORDER BY lm.joined_at DESC LIMIT 1`, [playerId]),
+      db.query(
+        `SELECT m.id, m.scheduled_at, m.venue,
+                ht.name AS home_team, ht.icon_emoji AS home_emoji,
+                at.name AS away_team, at.icon_emoji AS away_emoji
+         FROM matches m
+         JOIN teams ht ON ht.id = m.home_team_id
+         JOIN teams at ON at.id = m.away_team_id
+         WHERE m.status = 'SCHEDULED' AND m.scheduled_at > now()
+           AND (m.home_team_id IN (SELECT team_id FROM team_roster_memberships WHERE player_id=$1 AND status='ACTIVE')
+             OR m.away_team_id IN (SELECT team_id FROM team_roster_memberships WHERE player_id=$1 AND status='ACTIVE'))
+         ORDER BY m.scheduled_at ASC LIMIT 1`, [playerId]),
+      db.query(
+        `SELECT id, type, title, body, emoji, is_read AS "isRead", created_at AS "createdAt"
+         FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 5`, [playerId]),
+      db.query(
+        `SELECT COUNT(*) FILTER (WHERE NOT is_read) AS unread FROM notifications WHERE user_id = $1`, [playerId]),
+    ]);
+
+  if (!p) throw ApiError.notFound('Player not found');
+
+  ok(res, {
+    greeting: `Hi, ${p.full_name.split(' ')[0]}!`,
+    player: {
+      id: playerId,
+      playerId: p.player_code,
+      fullName: p.full_name,
+      avatarUrl: await storage.publicUrl(p.avatar_key),
+      qoScore: p.qo_score,
+      sport: p.sport_id ? { id: p.sport_id, name: p.sport_name, emoji: p.sport_emoji } : null,
+    },
+    activeLeague: membership ? {
+      id: membership.league_id,
+      name: membership.league_name,          // e.g. "Falcons U16 Premier League"
+      icon: membership.icon_emoji,
+      logoUrl: await storage.publicUrl(membership.logo_key),
+      gender: membership.gender,
+      season: membership.season,
+      team: membership.team_id
+        ? { id: membership.team_id, name: membership.team_name, icon: membership.team_emoji }
+        : null,                              // frontend falls back to "Not in a team"
+    } : null,                                // frontend falls back to "Join a league to get started"
+    upcomingMatch: nextMatch ? {
+      id: nextMatch.id,
+      scheduledAt: nextMatch.scheduled_at,
+      venue: nextMatch.venue,
+      homeTeam: { name: nextMatch.home_team, icon: nextMatch.home_emoji },
+      awayTeam: { name: nextMatch.away_team, icon: nextMatch.away_emoji },
+    } : null,
+    notifications: { unreadCount: Number(counts.unread), recent: notifications },
+  });
+}));
+
+// ---------------------------------------------------------------- GET /players/:id/profile
+router.get('/:id/profile', validate({ params: uuid }), asyncH(async (req, res) => {
+  const playerId = req.params.id;
+  await assertCanViewPlayer(req, playerId);
+
+  const [{ rows: [p] }, { rows: history }, { rows: recs }, { rows: [social] }] = await Promise.all([
+    db.query(
+      `SELECT pp.*, u.email, u.phone, s.name AS sport_name, s.emoji AS sport_emoji
+       FROM player_profiles pp
+       JOIN users u ON u.id = pp.user_id
+       LEFT JOIN sports s ON s.id = pp.primary_sport_id
+       WHERE pp.user_id = $1`, [playerId]),
+    db.query(`SELECT id, academy, role, start_year AS "startYear", end_year AS "endYear"
+              FROM academy_history WHERE player_id=$1 ORDER BY start_year DESC NULLS LAST`, [playerId]),
+    db.query(`SELECT r.id, r.text, r.created_at AS "createdAt", cp.full_name AS "coachName", cp.title AS "coachTitle"
+              FROM recommendations r JOIN coach_profiles cp ON cp.user_id = r.from_coach_id
+              WHERE r.player_id=$1 ORDER BY r.created_at DESC`, [playerId]),
+    db.query(`SELECT
+                (SELECT COUNT(*) FROM follows WHERE followee_id=$1) AS followers,
+                (SELECT COUNT(*) FROM follows WHERE follower_id=$1) AS following`, [playerId]),
+  ]);
+  if (!p) throw ApiError.notFound('Player not found');
+
+  ok(res, {
+    id: playerId,
+    playerId: p.player_code,
+    fullName: p.full_name,
+    avatarUrl: await storage.publicUrl(p.avatar_key),
+    dob: p.dob,
+    gender: p.gender,
+    location: p.location,
+    schoolAcademy: p.school_academy,
+    club: p.club,
+    bio: p.bio,
+    qoScore: p.qo_score,
+    sport: p.sport_name ? { name: p.sport_name, emoji: p.sport_emoji } : null,
+    followers: Number(social.followers),
+    following: Number(social.following),
+    academyHistory: history,
+    recommendations: recs,
+    settings: p.settings,
+  });
+}));
+
+// ---------------------------------------------------------------- GET /players/:id/performance
+// Powers the performance screen: Qo score, Qo Journey chart, recent match cards.
+router.get('/:id/performance', validate({ params: uuid }), asyncH(async (req, res) => {
+  const playerId = req.params.id;
+  await assertCanViewPlayer(req, playerId);
+
+  const [{ rows: [p] }, { rows: journey }, { rows: recent }] = await Promise.all([
+    db.query('SELECT qo_score FROM player_profiles WHERE user_id=$1', [playerId]),
+    db.query(
+      `SELECT to_char(period, 'Mon') AS label, period, qo_score AS "qoScore", matches_played AS "matchesPlayed", aggregates
+       FROM performance_metrics WHERE player_id=$1 ORDER BY period ASC LIMIT 12`, [playerId]),
+    db.query(
+      `SELECT ps.id, ps.stats, ps.qo_points AS "qoPoints", ps.rating,
+              m.id AS "matchId", m.scheduled_at AS "playedAt", m.result_summary AS "resultSummary",
+              myt.name AS "teamName",
+              CASE WHEN m.home_team_id = ps.team_id THEN at.name ELSE ht.name END AS opponent
+       FROM player_stats ps
+       JOIN matches m ON m.id = ps.match_id
+       JOIN teams myt ON myt.id = ps.team_id
+       JOIN teams ht ON ht.id = m.home_team_id
+       JOIN teams at ON at.id = m.away_team_id
+       WHERE ps.player_id = $1 AND m.status = 'COMPLETED'
+       ORDER BY m.scheduled_at DESC LIMIT 10`, [playerId]),
+  ]);
+  if (!p) throw ApiError.notFound('Player not found');
+
+  ok(res, {
+    qoScore: p.qo_score,
+    qoJourney: journey,          // [{label:'Jan', qoScore: 640, ...}]
+    recentMatches: recent.map((r) => ({
+      id: r.id,
+      matchId: r.matchId,
+      opponent: `vs ${r.opponent}`,   // matches the 'vs Thunder Strikers' card
+      playedAt: r.playedAt,
+      resultSummary: r.resultSummary,
+      stats: r.stats,                 // {"runs":78,"wickets":1,...}
+      qoPoints: r.qoPoints,
+      rating: r.rating,
+    })),
+  });
+}));
+
+// ---------------------------------------------------------------- GET /players/search  (coach: select-players screen)
+router.get('/', requireRole('COACH'), asyncH(async (req, res) => {
+  const { limit, offset, page } = pagination(req);
+  const q = (req.query.q || '').trim();
+  const params = [req.user.id];
+  let where = `l.owner_coach_id = $1`;
+  if (q) { params.push(`%${q}%`); where += ` AND (pp.full_name ILIKE $${params.length} OR pp.player_code ILIKE $${params.length})`; }
+  params.push(limit, offset);
+
+  const { rows } = await db.query(
+    `SELECT DISTINCT pp.user_id AS id, pp.player_code AS "playerId", pp.full_name AS "fullName",
+            pp.qo_score AS "qoScore", pp.avatar_key, COUNT(*) OVER() AS total
+     FROM player_profiles pp
+     JOIN league_memberships lm ON lm.player_id = pp.user_id
+     JOIN leagues l ON l.id = lm.league_id
+     WHERE ${where}
+     ORDER BY pp.full_name
+     LIMIT $${params.length - 1} OFFSET $${params.length}`, params);
+
+  const data = await Promise.all(rows.map(async (r) => ({
+    id: r.id, playerId: r.playerId, fullName: r.fullName, qoScore: r.qoScore,
+    avatarUrl: await storage.publicUrl(r.avatar_key),
+  })));
+  ok(res, data, pageMeta(page, limit, rows[0]?.total || 0));
+}));
+
+module.exports = router;
