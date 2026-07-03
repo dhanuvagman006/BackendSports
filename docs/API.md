@@ -62,6 +62,13 @@ Partial update; player fields: `fullName, dob (YYYY-MM-DD), gender, location, sc
 
 ### POST /me/avatar — multipart, field `avatar` (png/jpg/webp ≤ 5 MB) → `{ "avatarUrl" }`.
 
+### Academy history (player only) — powers the editable "Academy Experience" list
+- **GET /me/academy** → `[ { id, academy, role, startYear, endYear } ]`
+- **POST /me/academy** — `{ "academy", "role"?, "startYear"?, "endYear"? }` → `201` with the created row.
+- **PATCH /me/academy/:id** — same body; only your own rows.
+- **DELETE /me/academy/:id** → `{ "deleted": true }`.
+`endYear` must be ≥ `startYear` when both are provided; omit `endYear` for a current academy ("Present").
+
 ---
 
 ## Sports
@@ -99,6 +106,9 @@ Partial update; player fields: `fullName, dob (YYYY-MM-DD), gender, location, sc
 ```
 `activeLeague`, `team`, and `upcomingMatch` are `null` when absent — the frontend's existing fallback copy handles that.
 Access: the player themself, or a coach whose league the player belongs to.
+
+### GET /players/discover?sport=&q=&page=&limit=
+Public-profile leaderboard for the Dugout screen. Each row now includes `isFollowing` (whether *you* follow that player) alongside `followers`, `matchesPlayed`, `verified`, etc.
 
 ### GET /players/:id/profile
 Profile screen data: identity fields plus `followers`, `following`, `academyHistory[]` (`{academy, role, startYear, endYear}`), `recommendations[]` (`{text, coachName, coachTitle, createdAt}`), and `settings`.
@@ -142,7 +152,7 @@ payload = { "name": "Falcons U16 Premier League", "location": "Bangalore, Karnat
 
 ### GET /leagues — my leagues (coach: owned; player: joined). Paginated; each item has `counts: {players, teams}`.
 ### GET /leagues/:id — details + `counts: { teams, players, matchesPlayed }`. Access: owner coach or member player.
-### GET /leagues/:id/teams — `[ { id, name, icon, logoUrl, rosterCount } ]`.
+### GET /leagues/:id/teams — `[ { id, name, icon, logoUrl, rosterCount } ]`. Access: owner coach or member player.
 ### GET /leagues/:id/code (owner) — `{ code, useCount, maxUses, expiresAt, createdAt }`.
 ### POST /leagues/:id/code/rotate (owner) — revokes the current code, issues a new one.
 ### POST /leagues/:id/share (owner) — `{ code, message, deepLink: "sportyqo://join?code=482913" }` for the share sheet.

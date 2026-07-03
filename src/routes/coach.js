@@ -3,7 +3,7 @@ const multer = require('multer');
 const { z } = require('zod');
 const db = require('../config/db');
 const storage = require('../services/storage');
-const { ok, created, asyncH } = require('../utils/http');
+const { ok, created, asyncH, ApiError } = require('../utils/http');
 const { authenticate, requireRole, validate } = require('../middleware');
 
 const router = express.Router();
@@ -34,6 +34,8 @@ router.get('/dashboard', asyncH(async (req, res) => {
          (SELECT COUNT(*) FROM notifications WHERE user_id=$1 AND NOT is_read) AS unread,
          (SELECT COUNT(*) FROM recommendations WHERE from_coach_id=$1) AS recommendations`, [coachId]),
   ]);
+
+  if (!cp) throw ApiError.notFound('Coach profile not found');
 
   ok(res, {
     coach: {

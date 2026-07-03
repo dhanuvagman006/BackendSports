@@ -175,6 +175,14 @@ router.get('/:id', validate({ params: uuid }), asyncH(async (req, res) => {
 
 // ---------------------------------------------------------------- GET /leagues/:id/teams
 router.get('/:id/teams', validate({ params: uuid }), asyncH(async (req, res) => {
+  const { rows: [lg] } = await db.query('SELECT id, owner_coach_id FROM leagues WHERE id=$1', [req.params.id]);
+  if (!lg) throw ApiError.notFound('League not found');
+  if (req.user.role === 'COACH' && lg.owner_coach_id !== req.user.id) throw ApiError.forbidden();
+  if (req.user.role === 'PLAYER') {
+    const { rowCount } = await db.query(
+      'SELECT 1 FROM league_memberships WHERE league_id=$1 AND player_id=$2', [lg.id, req.user.id]);
+    if (!rowCount) throw ApiError.forbidden('Join this league to view its teams');
+  }
   const { rows } = await db.query(
     `SELECT t.id, t.name, t.icon_emoji AS icon, t.logo_key,
             COUNT(trm.id) FILTER (WHERE trm.status='ACTIVE') AS roster_count

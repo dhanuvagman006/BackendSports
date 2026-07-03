@@ -106,7 +106,7 @@ router.get('/:id/profile', validate({ params: uuid }), asyncH(async (req, res) =
 
   const [{ rows: [p] }, { rows: history }, { rows: recs }, { rows: [social] }] = await Promise.all([
     db.query(
-      `SELECT pp.*, u.email, u.phone, s.name AS sport_name, s.emoji AS sport_emoji
+      `SELECT pp.*, u.email, u.phone, u.is_verified, s.name AS sport_name, s.emoji AS sport_emoji
        FROM player_profiles pp
        JOIN users u ON u.id = pp.user_id
        LEFT JOIN sports s ON s.id = pp.primary_sport_id
@@ -126,6 +126,7 @@ router.get('/:id/profile', validate({ params: uuid }), asyncH(async (req, res) =
     id: playerId,
     playerId: p.player_code,
     fullName: p.full_name,
+    isVerified: p.is_verified === true,
     avatarUrl: await storage.publicUrl(p.avatar_key),
     dob: p.dob,
     gender: p.gender,
@@ -217,6 +218,8 @@ router.get('/discover', asyncH(async (req, res) => {
     params.push(`%${q}%`);
     where += ` AND (pp.full_name ILIKE $${params.length} OR pp.player_code ILIKE $${params.length})`;
   }
+  params.push(req.user.id);
+  const meIdx = params.length;
   params.push(limit, offset);
 
   const { rows } = await db.query(
@@ -225,6 +228,7 @@ router.get('/discover', asyncH(async (req, res) => {
             pp.avatar_key, u.is_verified AS verified,
             s.name AS sport, s.emoji AS "sportEmoji",
             (SELECT COUNT(*) FROM follows f WHERE f.followee_id = pp.user_id) AS followers,
+            EXISTS(SELECT 1 FROM follows f2 WHERE f2.follower_id = $${meIdx} AND f2.followee_id = pp.user_id) AS "isFollowing",
             (SELECT COUNT(*) FROM player_stats ps WHERE ps.player_id = pp.user_id) AS "matchesPlayed",
             COUNT(*) OVER() AS total
      FROM player_profiles pp
@@ -249,6 +253,7 @@ router.get('/discover', asyncH(async (req, res) => {
       sport: r.sport,
       sportEmoji: r.sportEmoji,
       followers: Number(r.followers),
+      isFollowing: r.isFollowing === true,
       matchesPlayed: Number(r.matchesPlayed),
     });
   }
