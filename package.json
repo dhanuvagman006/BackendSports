@@ -4,13 +4,16 @@
   "description": "Production backend for the SportyQo Flutter app (Player/Coach sports platform)",
   "main": "src/server.js",
   "type": "commonjs",
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "migrate": "node scripts/migrate.js",
     "seed": "node scripts/seed.js",
-    "db:reset": "node scripts/migrate.js --reset && node scripts/seed.js"
+    "db:reset": "node scripts/migrate.js --reset && node scripts/seed.js",
+    "test": "node --test tests/api.test.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.600.0",

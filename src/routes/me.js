@@ -10,10 +10,10 @@ const router = express.Router();
 const uploadMw = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 },
-  fileFilter: (_req, file, cb) => cb(
-    /^image\/(png|jpe?g|webp)$/.test(file.mimetype) ? null : new Error('Only PNG/JPG/WEBP allowed'),
-    /^image\/(png|jpe?g|webp)$/.test(file.mimetype),
-  ),
+  fileFilter: (_req, file, cb) => {
+    if (/^image\/(png|jpe?g|webp)$/.test(file.mimetype)) return cb(null, true);
+    cb(ApiError.badRequest('Only PNG, JPG or WEBP images are allowed'));
+  },
 });
 
 async function loadMe(userId, role) {

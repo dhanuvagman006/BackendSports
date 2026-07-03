@@ -8,7 +8,14 @@ const { authenticate, requireRole, validate } = require('../middleware');
 
 const router = express.Router();
 router.use(authenticate, requireRole('COACH'));
-const uploadMw = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+const uploadMw = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (/^(application\/pdf|image\/(png|jpe?g|webp))$/.test(file.mimetype)) return cb(null, true);
+    cb(ApiError.badRequest('Only PDF, PNG, JPG or WEBP files are allowed'));
+  },
+});
 
 // ---------------------------------------------------------------- GET /coach/dashboard  (coach home screen)
 router.get('/dashboard', asyncH(async (req, res) => {

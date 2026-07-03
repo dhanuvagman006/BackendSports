@@ -51,6 +51,18 @@ const errorHandler = (err, req, res, _next) => {
       error: { code: err.code, message: err.message, ...(err.details ? { details: err.details } : {}) },
     });
   }
+  // Multer upload errors (file too large, unexpected field) → 400
+  if (err.name === 'MulterError') {
+    return res.status(400).json({
+      success: false,
+      error: {
+        code: 'BAD_REQUEST',
+        message: err.code === 'LIMIT_FILE_SIZE'
+          ? 'File is too large'
+          : `Upload error: ${err.message}`,
+      },
+    });
+  }
   // Postgres unique violation → 409
   if (err.code === '23505') {
     return res.status(409).json({

@@ -141,3 +141,12 @@ npm run dev
 6. **Rosters, stats, performance.** Team selection → `GET /leagues/:id/teams`; roster → `GET /teams/:id/roster`; coach stat editing → `PATCH /teams/:id/players/:playerId/stats`; performance screen → `GET /players/:id/performance` (`qoJourney` maps to the chart, `recentMatches` to the cards).
 7. **Content screens.** Playbook, dugout, notifications map 1:1 to their endpoints; dugout can poll `GET /dugout/:id/messages` initially (WebSockets can be added later without changing the REST shapes).
 8. **Rollout.** Integrate screen-by-screen behind a `useBackend` flag; the seed data guarantees each screen looks identical to the current mocks, so visual regressions are easy to spot.
+
+## Enabling CI
+
+The GitHub Actions workflow lives at `ci/github-actions-ci.yml` (pushing workflow files needs a token with the `workflow` scope, which the deploy token lacked). To enable CI:
+
+```bash
+mkdir -p .github/workflows && git mv ci/github-actions-ci.yml .github/workflows/ci.yml
+git commit -m "Enable CI" && git push
+```

@@ -1,0 +1,31 @@
+name: Backend CI
+on:
+  push: { branches: [main] }
+  pull_request: { branches: [main] }
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: sportyqo
+          POSTGRES_PASSWORD: sportyqo
+          POSTGRES_DB: sportyqo
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U sportyqo"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://sportyqo:sportyqo@localhost:5432/sportyqo
+      JWT_ACCESS_SECRET: ci-access-secret
+      JWT_REFRESH_SECRET: ci-refresh-secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - run: npm run migrate
+      - run: npm run seed
+      - run: npm test

@@ -9,7 +9,14 @@ const { newLeagueCode, generateUnique } = require('../utils/codes');
 
 const router = express.Router();
 router.use(authenticate);
-const uploadMw = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
+const uploadMw = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (/^image\/(png|jpe?g|webp)$/.test(file.mimetype)) return cb(null, true);
+    cb(ApiError.badRequest('Only PNG, JPG or WEBP images are allowed'));
+  },
+});
 const uuid = z.object({ id: z.string().uuid() });
 
 const genderMap = { "Men's": 'MENS', "Women's": 'WOMENS', Mixed: 'MIXED', MENS: 'MENS', WOMENS: 'WOMENS', MIXED: 'MIXED' };
