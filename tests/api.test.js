@@ -278,3 +278,111 @@ test('notifications list and mark-read', async () => {
   const mark = await api('POST', '/notifications/read-all', { token, body: {} });
   assert.ok([200, 404].includes(mark.status)); // route optional
 });
+
+// ── playbook media uploads ────────────────────────────────────────────
+const newCoach = async (name = 'Flow Coach') => {
+  const email = `c${uniq()}@test.dev`;
+  const r = await api('POST', '/auth/register/coach',
+    { body: { email, password: PASS, fullName: name, academy: 'Test Academy' } });
+  assert.strictEqual(r.status, 201);
+  return { token: r.json.data.accessToken, userId: r.json.data.userId };
+};
+
+const uploadPlaybook = async (token, fields, filename, buf, mime) => {
+  const m = multipart(fields, 'media', filename, buf, mime);
+  const res = await fetch(`${base}/playbook`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': m.type },
+    body: m.body,
+  });
+  return { status: res.status, json: await res.json() };
+};
+
+test('player uploads a playbook photo: saved, listed, served, deletable', async () => {
+  const { token } = await newPlayer('Uploader');
+  const up = await uploadPlaybook(token,
+    { title: 'My batting form', tags: '["batting","form"]' }, 'form.png', png(), 'image/png');
+  assert.strictEqual(up.status, 201);
+  assert.ok(up.json.data.mediaUrl, 'upload returns a media URL');
+  assert.strictEqual(up.json.data.kind, 'DRILL', 'photos default to DRILL');
+  assert.deepStrictEqual(up.json.data.tags, ['batting', 'form']);
+
+  const served = await fetch(`${base}${up.json.data.mediaUrl}`);
+  assert.strictEqual(served.status, 200, 'uploaded media is downloadable');
+
+  const list = await api('GET', '/playbook?q=My batting form', { token });
+  const mine = list.json.data.find((i) => i.id === up.json.data.id);
+  assert.ok(mine, 'uploaded item appears in GET /playbook');
+  assert.strictEqual(mine.isMine, true);
+
+  const del = await api('DELETE', `/playbook/${up.json.data.id}`, { token });
+  assert.strictEqual(del.status, 200);
+  const after = await api('GET', '/playbook?q=My batting form', { token });
+  assert.ok(!after.json.data.some((i) => i.id === up.json.data.id), 'deleted item disappears');
+});
+
+test('player uploads a video: kind defaults to VIDEO', async () => {
+  const { token } = await newPlayer('Video Uploader');
+  const fakeMp4 = Buffer.concat([
+    Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftypmp42'), Buffer.alloc(64, 7)]);
+  const up = await uploadPlaybook(token, { title: 'Net session' }, 'net.mp4', fakeMp4, 'video/mp4');
+  assert.strictEqual(up.status, 201);
+  assert.strictEqual(up.json.data.kind, 'VIDEO');
+  assert.match(up.json.data.mediaUrl, /\.mp4$/);
+});
+
+test('player-authored playbook items are private to the author', async () => {
+  const author = await newPlayer('Private Author');
+  const secretTitle = `Secret drill ${uniq()}`;
+  const up = await uploadPlaybook(author.token, { title: secretTitle }, 'p.png', png(), 'image/png');
+  assert.strictEqual(up.status, 201);
+
+  const stranger = await newPlayer('Stranger');
+  const list = await api('GET', `/playbook?q=${encodeURIComponent(secretTitle)}`, { token: stranger.token });
+  assert.strictEqual(list.status, 200);
+  assert.ok(!list.json.data.some((i) => i.title === secretTitle),
+    'another user must not see a player-private item');
+
+  const delOther = await api('DELETE', `/playbook/${up.json.data.id}`, { token: stranger.token });
+  assert.strictEqual(delOther.status, 404, 'only the author can delete');
+});
+
+test('coach JSON-only playbook create still works (back-compat)', async () => {
+  const coach = await newCoach();
+  const r = await api('POST', '/playbook',
+    { token: coach.token, body: { title: 'Zone press', kind: 'STRATEGY', tags: ['defence'] } });
+  assert.strictEqual(r.status, 201);
+  assert.strictEqual(r.json.data.kind, 'STRATEGY');
+  assert.strictEqual(r.json.data.mediaUrl, null);
+});
+
+test('playbook rejects wrong file types and missing titles cleanly', async () => {
+  const { token } = await newPlayer('Validator');
+  const badType = await uploadPlaybook(token, { title: 'Nope' }, 'x.pdf', Buffer.from('%PDF'), 'application/pdf');
+  assert.strictEqual(badType.status, 400);
+  const noTitle = await uploadPlaybook(token, {}, 'y.png', png(), 'image/png');
+  assert.strictEqual(noTitle.status, 400);
+});
+
+test('404 message names the missing route for diagnosability', async () => {
+  const { token } = await newPlayer();
+  const r = await api('GET', '/dugout//messages', { token });
+  assert.strictEqual(r.status, 404);
+  assert.match(r.json.error.message, /GET \/dugout\/\/messages/);
+});
+
+test('academy entries persist through the profile reload path the app uses', async () => {
+  const { token, userId } = await newPlayer('Academy Persister');
+  const add = await api('POST', '/me/academy',
+    { token, body: { academy: 'Persistence FC', role: 'Winger', startYear: 2020, endYear: 2024 } });
+  assert.strictEqual(add.status, 201);
+
+  // The profile screen reloads via GET /players/:id/profile → academyHistory
+  const prof = await api('GET', `/players/${userId}/profile`, { token });
+  assert.strictEqual(prof.status, 200);
+  assert.ok(prof.json.data.academyHistory.some((a) => a.academy === 'Persistence FC'));
+
+  // And the dedicated endpoint agrees
+  const mine = await api('GET', '/me/academy', { token });
+  assert.ok(mine.json.data.some((a) => a.academy === 'Persistence FC'));
+});

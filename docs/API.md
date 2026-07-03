@@ -211,10 +211,21 @@ Upserts the stat line for that match. The player's profile `qoScore` is adjusted
 ## Playbook
 
 ### GET /playbook?sportId=&kind=DRILL|STRATEGY|VIDEO|NOTE&q=&page=&limit=
-Visibility: global items, items scoped to your teams/leagues, and your own items.
-`[ { id, kind, title, description, tags[], mediaUrl, sport: {name, emoji}, createdAt } ]`.
+Visibility: global **coach-authored** items, items scoped to your teams/leagues, and your own items.
+Player-authored items are always private to their author.
+`[ { id, kind, title, description, tags[], mediaUrl, sport: {name, emoji}, authorName, isMine, createdAt } ]`.
 
-### POST /playbook (coach) — `{ title, description?, kind?, sportId?, teamId?, leagueId?, tags? }`.
+### POST /playbook (player or coach)
+Two request styles:
+- `application/json` — `{ title, description?, kind?, sportId?, teamId?, leagueId?, tags? }` (metadata only).
+- `multipart/form-data` — same fields as form values plus a `media` file (photo ≤ 10 MB: PNG/JPG/WEBP/GIF; video ≤ 100 MB: MP4/MOV/WEBM). `tags` may be a JSON array string or comma-separated.
+
+`kind` defaults from the media type when omitted (video → `VIDEO`, photo → `DRILL`, none → `NOTE`).
+Players cannot scope items to teams/leagues (their items are personal); coaches can scope to leagues/teams they own.
+Returns `201 { id, kind, title, description, tags[], mediaUrl, isMine, createdAt }`.
+
+### DELETE /playbook/:id (author only)
+Deletes the item and its stored media. `200 { deleted: true }`.
 
 ---
 

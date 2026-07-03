@@ -25,6 +25,113 @@ async function assertCanViewPlayer(req, playerId) {
   if (!rowCount) throw ApiError.forbidden('This player is not in any of your leagues');
 }
 
+// NOTE: static paths ('/discover', '/') are registered BEFORE the '/:id/...'
+// patterns so a future single-segment '/:id' route can never shadow them
+// (a shadowed '/discover' surfaces in the app as a confusing 404).
+// ---------------------------------------------------------------- GET /players/search  (coach: select-players screen)
+// ---------------------------------------------------------------- GET /players/discover
+// Leaderboard-style discovery for the Dugout screen. Any authenticated user.
+// Only players who keep their profile public are listed.
+router.get('/discover', asyncH(async (req, res) => {
+  const { limit, offset, page } = pagination(req);
+  const sport = (req.query.sport || '').trim();
+  const q = (req.query.q || '').trim();
+  const params = [];
+  let where = `(pp.settings->>'publicProfile')::boolean IS DISTINCT FROM false`;
+  if (sport) {
+    params.push(sport);
+    where += ` AND s.name ILIKE $${params.length}`;
+  }
+  if (q) {
+    params.push(`%${q}%`);
+    where += ` AND (pp.full_name ILIKE $${params.length} OR pp.player_code ILIKE $${params.length})`;
+  }
+  params.push(req.user.id);
+  const meIdx = params.length;
+  params.push(limit, offset);
+
+  const { rows } = await db.query(
+    `SELECT pp.user_id AS id, pp.full_name AS "fullName", pp.player_code AS "playerCode",
+            pp.qo_score AS "qoScore", pp.school_academy AS academy, pp.location,
+            pp.avatar_key, u.is_verified AS verified,
+            s.name AS sport, s.emoji AS "sportEmoji",
+            (SELECT COUNT(*) FROM follows f WHERE f.followee_id = pp.user_id) AS followers,
+            EXISTS(SELECT 1 FROM follows f2 WHERE f2.follower_id = $${meIdx} AND f2.followee_id = pp.user_id) AS "isFollowing",
+            (SELECT COUNT(*) FROM player_stats ps WHERE ps.player_id = pp.user_id) AS "matchesPlayed",
+            COUNT(*) OVER() AS total
+     FROM player_profiles pp
+     JOIN users u ON u.id = pp.user_id
+     LEFT JOIN sports s ON s.id = pp.primary_sport_id
+     WHERE ${where}
+     ORDER BY pp.qo_score DESC, pp.full_name ASC
+     LIMIT $${params.length - 1} OFFSET $${params.length}`, params);
+
+  const total = rows.length ? Number(rows[0].total) : 0;
+  const data = [];
+  for (const r of rows) {
+    data.push({
+      id: r.id,
+      fullName: r.fullName,
+      playerCode: r.playerCode,
+      qoScore: r.qoScore,
+      academy: r.academy,
+      location: r.location,
+      avatarUrl: await storage.publicUrl(r.avatar_key),
+      verified: r.verified,
+      sport: r.sport,
+      sportEmoji: r.sportEmoji,
+      followers: Number(r.followers),
+      isFollowing: r.isFollowing === true,
+      matchesPlayed: Number(r.matchesPlayed),
+    });
+  }
+  ok(res, data, pageMeta(page, limit, total));
+}));
+
+// ---------------------------------------------------------------- GET /players (coach: select-players screen)
+router.get('/', requireRole('COACH'), asyncH(async (req, res) => {
+  const { limit, offset, page } = pagination(req);
+  const q = (req.query.q || '').trim();
+  const params = [req.user.id];
+  let where = `l.owner_coach_id = $1`;
+  if (q) { params.push(`%${q}%`); where += ` AND (pp.full_name ILIKE $${params.length} OR pp.player_code ILIKE $${params.length})`; }
+  params.push(limit, offset);
+
+  const { rows } = await db.query(
+    `SELECT DISTINCT ON (pp.user_id)
+            pp.user_id AS id, pp.player_code AS "playerId", pp.full_name AS "fullName",
+            pp.qo_score AS "qoScore", pp.avatar_key,
+            s.emoji AS "sportEmoji", s.name AS "sportName",
+            t.name AS "teamName", trm.position, trm.status AS roster_status,
+            lm.joined_at AS "joinedAt",
+            EXISTS(SELECT 1 FROM follows f WHERE f.follower_id = $1 AND f.followee_id = pp.user_id) AS "isFollowing",
+            (SELECT COUNT(*) FROM follows f2 WHERE f2.followee_id = pp.user_id) AS followers,
+            COUNT(*) OVER() AS total
+     FROM player_profiles pp
+     JOIN league_memberships lm ON lm.player_id = pp.user_id
+     JOIN leagues l ON l.id = lm.league_id
+     LEFT JOIN sports s ON s.id = pp.primary_sport_id
+     LEFT JOIN team_roster_memberships trm
+            ON trm.player_id = pp.user_id AND trm.status = 'ACTIVE'
+     LEFT JOIN teams t ON t.id = trm.team_id AND t.league_id = lm.league_id
+     WHERE ${where}
+     ORDER BY pp.user_id, t.name NULLS LAST
+     LIMIT $${params.length - 1} OFFSET $${params.length}`, params);
+
+  const data = await Promise.all(rows.map(async (r) => ({
+    id: r.id, playerId: r.playerId, fullName: r.fullName, qoScore: r.qoScore,
+    avatarUrl: await storage.publicUrl(r.avatar_key),
+    sportEmoji: r.sportEmoji, sportName: r.sportName,
+    teamName: r.teamName, position: r.position,
+    onTeam: r.roster_status === 'ACTIVE',
+    isFollowing: r.isFollowing === true,
+    followers: Number(r.followers || 0),
+    joinedAt: r.joinedAt,
+  })));
+  ok(res, data, pageMeta(page, limit, rows[0]?.total || 0));
+}));
+
+
 // ---------------------------------------------------------------- GET /players/:id/home
 router.get('/:id/home', validate({ params: uuid }), asyncH(async (req, res) => {
   const playerId = req.params.id;
@@ -200,107 +307,7 @@ router.get('/:id/performance', validate({ params: uuid }), asyncH(async (req, re
   });
 }));
 
-// ---------------------------------------------------------------- GET /players/search  (coach: select-players screen)
-// ---------------------------------------------------------------- GET /players/discover
-// Leaderboard-style discovery for the Dugout screen. Any authenticated user.
-// Only players who keep their profile public are listed.
-router.get('/discover', asyncH(async (req, res) => {
-  const { limit, offset, page } = pagination(req);
-  const sport = (req.query.sport || '').trim();
-  const q = (req.query.q || '').trim();
-  const params = [];
-  let where = `(pp.settings->>'publicProfile')::boolean IS DISTINCT FROM false`;
-  if (sport) {
-    params.push(sport);
-    where += ` AND s.name ILIKE $${params.length}`;
-  }
-  if (q) {
-    params.push(`%${q}%`);
-    where += ` AND (pp.full_name ILIKE $${params.length} OR pp.player_code ILIKE $${params.length})`;
-  }
-  params.push(req.user.id);
-  const meIdx = params.length;
-  params.push(limit, offset);
 
-  const { rows } = await db.query(
-    `SELECT pp.user_id AS id, pp.full_name AS "fullName", pp.player_code AS "playerCode",
-            pp.qo_score AS "qoScore", pp.school_academy AS academy, pp.location,
-            pp.avatar_key, u.is_verified AS verified,
-            s.name AS sport, s.emoji AS "sportEmoji",
-            (SELECT COUNT(*) FROM follows f WHERE f.followee_id = pp.user_id) AS followers,
-            EXISTS(SELECT 1 FROM follows f2 WHERE f2.follower_id = $${meIdx} AND f2.followee_id = pp.user_id) AS "isFollowing",
-            (SELECT COUNT(*) FROM player_stats ps WHERE ps.player_id = pp.user_id) AS "matchesPlayed",
-            COUNT(*) OVER() AS total
-     FROM player_profiles pp
-     JOIN users u ON u.id = pp.user_id
-     LEFT JOIN sports s ON s.id = pp.primary_sport_id
-     WHERE ${where}
-     ORDER BY pp.qo_score DESC, pp.full_name ASC
-     LIMIT $${params.length - 1} OFFSET $${params.length}`, params);
-
-  const total = rows.length ? Number(rows[0].total) : 0;
-  const data = [];
-  for (const r of rows) {
-    data.push({
-      id: r.id,
-      fullName: r.fullName,
-      playerCode: r.playerCode,
-      qoScore: r.qoScore,
-      academy: r.academy,
-      location: r.location,
-      avatarUrl: await storage.publicUrl(r.avatar_key),
-      verified: r.verified,
-      sport: r.sport,
-      sportEmoji: r.sportEmoji,
-      followers: Number(r.followers),
-      isFollowing: r.isFollowing === true,
-      matchesPlayed: Number(r.matchesPlayed),
-    });
-  }
-  ok(res, data, pageMeta(page, limit, total));
-}));
-
-router.get('/', requireRole('COACH'), asyncH(async (req, res) => {
-  const { limit, offset, page } = pagination(req);
-  const q = (req.query.q || '').trim();
-  const params = [req.user.id];
-  let where = `l.owner_coach_id = $1`;
-  if (q) { params.push(`%${q}%`); where += ` AND (pp.full_name ILIKE $${params.length} OR pp.player_code ILIKE $${params.length})`; }
-  params.push(limit, offset);
-
-  const { rows } = await db.query(
-    `SELECT DISTINCT ON (pp.user_id)
-            pp.user_id AS id, pp.player_code AS "playerId", pp.full_name AS "fullName",
-            pp.qo_score AS "qoScore", pp.avatar_key,
-            s.emoji AS "sportEmoji", s.name AS "sportName",
-            t.name AS "teamName", trm.position, trm.status AS roster_status,
-            lm.joined_at AS "joinedAt",
-            EXISTS(SELECT 1 FROM follows f WHERE f.follower_id = $1 AND f.followee_id = pp.user_id) AS "isFollowing",
-            (SELECT COUNT(*) FROM follows f2 WHERE f2.followee_id = pp.user_id) AS followers,
-            COUNT(*) OVER() AS total
-     FROM player_profiles pp
-     JOIN league_memberships lm ON lm.player_id = pp.user_id
-     JOIN leagues l ON l.id = lm.league_id
-     LEFT JOIN sports s ON s.id = pp.primary_sport_id
-     LEFT JOIN team_roster_memberships trm
-            ON trm.player_id = pp.user_id AND trm.status = 'ACTIVE'
-     LEFT JOIN teams t ON t.id = trm.team_id AND t.league_id = lm.league_id
-     WHERE ${where}
-     ORDER BY pp.user_id, t.name NULLS LAST
-     LIMIT $${params.length - 1} OFFSET $${params.length}`, params);
-
-  const data = await Promise.all(rows.map(async (r) => ({
-    id: r.id, playerId: r.playerId, fullName: r.fullName, qoScore: r.qoScore,
-    avatarUrl: await storage.publicUrl(r.avatar_key),
-    sportEmoji: r.sportEmoji, sportName: r.sportName,
-    teamName: r.teamName, position: r.position,
-    onTeam: r.roster_status === 'ACTIVE',
-    isFollowing: r.isFollowing === true,
-    followers: Number(r.followers || 0),
-    joinedAt: r.joinedAt,
-  })));
-  ok(res, data, pageMeta(page, limit, rows[0]?.total || 0));
-}));
 
 
 // ---------------------------------------------------------------- POST /players/:id/follow

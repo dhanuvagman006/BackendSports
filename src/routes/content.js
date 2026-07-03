@@ -1,9 +1,25 @@
 const express = require('express');
+const multer = require('multer');
 const { z } = require('zod');
 const db = require('../config/db');
 const storage = require('../services/storage');
 const { ok, created, asyncH, ApiError, pagination, pageMeta } = require('../utils/http');
 const { authenticate, requireRole, validate } = require('../middleware');
+
+// Playbook media: photos up to 10 MB, videos up to 100 MB (checked per-type below).
+const IMAGE_RE = /^image\/(png|jpe?g|webp|gif)$/;
+const VIDEO_RE = /^video\/(mp4|quicktime|webm|3gpp|x-msvideo)$/;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_VIDEO_BYTES = 100 * 1024 * 1024;
+
+const mediaUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_VIDEO_BYTES },
+  fileFilter: (_req, file, cb) => {
+    if (IMAGE_RE.test(file.mimetype) || VIDEO_RE.test(file.mimetype)) return cb(null, true);
+    cb(ApiError.badRequest('Only PNG/JPG/WEBP/GIF images or MP4/MOV/WEBM videos are allowed'));
+  },
+});
 
 const playbook = express.Router();
 const dugout = express.Router();
@@ -17,8 +33,10 @@ playbook.get('/', asyncH(async (req, res) => {
   const { limit, offset, page } = pagination(req);
   const params = [req.user.id];
   const clauses = [
-    // visible if: global item for my sport, OR scoped to a team/league I belong to / own
-    `(pi.team_id IS NULL AND pi.league_id IS NULL
+    // visible if: global COACH-authored item, OR scoped to a team/league I belong to / own,
+    // OR my own item. Player-authored items are always private to their author.
+    `((pi.team_id IS NULL AND pi.league_id IS NULL
+        AND EXISTS (SELECT 1 FROM users au WHERE au.id = pi.author_id AND au.role = 'COACH'))
       OR pi.team_id IN (SELECT team_id FROM team_roster_memberships WHERE player_id=$1 AND status='ACTIVE')
       OR pi.league_id IN (SELECT league_id FROM league_memberships WHERE player_id=$1)
       OR pi.league_id IN (SELECT id FROM leagues WHERE owner_coach_id=$1)
@@ -31,8 +49,11 @@ playbook.get('/', asyncH(async (req, res) => {
 
   const { rows } = await db.query(
     `SELECT pi.id, pi.kind, pi.title, pi.description, pi.tags, pi.media_key, pi.created_at AS "createdAt",
+            pi.author_id, COALESCE(app.full_name, acp.full_name) AS author_name,
             s.name AS sport_name, s.emoji AS sport_emoji, COUNT(*) OVER() AS total
      FROM playbook_items pi
+     LEFT JOIN player_profiles app ON app.user_id = pi.author_id
+     LEFT JOIN coach_profiles acp ON acp.user_id = pi.author_id
      LEFT JOIN sports s ON s.id = pi.sport_id
      WHERE ${clauses.join(' AND ')}
      ORDER BY pi.created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`, params);
@@ -41,34 +62,100 @@ playbook.get('/', asyncH(async (req, res) => {
     id: r.id, kind: r.kind, title: r.title, description: r.description, tags: r.tags,
     mediaUrl: await storage.publicUrl(r.media_key),
     sport: r.sport_name ? { name: r.sport_name, emoji: r.sport_emoji } : null,
+    authorName: r.author_name,
+    isMine: r.author_id === req.user.id,
     createdAt: r.createdAt,
   })));
   ok(res, data, pageMeta(page, limit, rows[0]?.total || 0));
 }));
 
-// POST /playbook (coach)
-playbook.post('/', requireRole('COACH'), validate({
-  body: z.object({
-    title: z.string().min(3).max(140),
-    description: z.string().max(2000).optional(),
-    kind: z.enum(['DRILL', 'STRATEGY', 'VIDEO', 'NOTE']).default('DRILL'),
-    sportId: z.string().uuid().optional(),
-    teamId: z.string().uuid().optional(),
-    leagueId: z.string().uuid().optional(),
-    tags: z.array(z.string().max(30)).max(10).default([]),
-  }),
-}), asyncH(async (req, res) => {
-  const b = req.body;
-  if (b.leagueId) {
-    const { rowCount } = await db.query('SELECT 1 FROM leagues WHERE id=$1 AND owner_coach_id=$2', [b.leagueId, req.user.id]);
+// POST /playbook — create an item, optionally with a media file.
+// Accepts application/json (metadata only) OR multipart/form-data with a
+// "media" file field (photo or video) plus the same metadata fields.
+// Coaches can scope items to their leagues/teams; player-authored items are
+// always private to the player (see the GET visibility rule above).
+const playbookBody = z.object({
+  title: z.string().min(3).max(140),
+  description: z.string().max(2000).optional(),
+  kind: z.enum(['DRILL', 'STRATEGY', 'VIDEO', 'NOTE']).optional(),
+  sportId: z.string().uuid().optional(),
+  teamId: z.string().uuid().optional(),
+  leagueId: z.string().uuid().optional(),
+  tags: z.array(z.string().max(30)).max(10).default([]),
+});
+
+// Multipart fields arrive as strings — normalise before zod validation.
+const normalizePlaybookBody = (raw) => {
+  const b = { ...raw };
+  for (const k of ['description', 'kind', 'sportId', 'teamId', 'leagueId']) {
+    if (b[k] === '' || b[k] === 'null') delete b[k];
+  }
+  if (typeof b.tags === 'string') {
+    try { b.tags = JSON.parse(b.tags); } catch { /* fall through */ }
+    if (typeof b.tags === 'string') {
+      b.tags = b.tags.split(',').map((t) => t.trim()).filter(Boolean);
+    }
+  }
+  return b;
+};
+
+playbook.post('/', mediaUpload.single('media'), asyncH(async (req, res) => {
+  const parsed = playbookBody.safeParse(normalizePlaybookBody(req.body || {}));
+  if (!parsed.success) {
+    throw ApiError.badRequest('Validation failed',
+      parsed.error.errors.map((e) => ({ field: e.path.join('.'), message: e.message })));
+  }
+  const b = parsed.data;
+
+  const file = req.file || null;
+  const isVideo = file ? VIDEO_RE.test(file.mimetype) : false;
+  if (file && !isVideo && file.size > MAX_IMAGE_BYTES) {
+    throw ApiError.badRequest('Images must be 10 MB or smaller');
+  }
+  // Default the kind from the media type when the client doesn't send one.
+  const kind = b.kind || (isVideo ? 'VIDEO' : (file ? 'DRILL' : 'NOTE'));
+
+  const isCoach = req.user.role === 'COACH';
+  // Players may not scope items to teams/leagues — their items are personal.
+  const teamId = isCoach ? (b.teamId || null) : null;
+  const leagueId = isCoach ? (b.leagueId || null) : null;
+  if (leagueId) {
+    const { rowCount } = await db.query('SELECT 1 FROM leagues WHERE id=$1 AND owner_coach_id=$2', [leagueId, req.user.id]);
     if (!rowCount) throw ApiError.forbidden('Not your league');
   }
+  if (teamId) {
+    const { rowCount } = await db.query(
+      `SELECT 1 FROM teams t JOIN leagues l ON l.id = t.league_id
+       WHERE t.id=$1 AND l.owner_coach_id=$2`, [teamId, req.user.id]);
+    if (!rowCount) throw ApiError.forbidden('Not your team');
+  }
+
+  const mediaKey = file ? await storage.upload('playbook', file) : null;
+  try {
+    const { rows: [row] } = await db.query(
+      `INSERT INTO playbook_items (author_id, sport_id, team_id, league_id, kind, title, description, tags, media_key)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       RETURNING id, kind, title, description, tags, media_key, created_at AS "createdAt"`,
+      [req.user.id, b.sportId || null, teamId, leagueId, kind, b.title, b.description || null, b.tags, mediaKey]);
+    created(res, {
+      id: row.id, kind: row.kind, title: row.title, description: row.description,
+      tags: row.tags, mediaUrl: await storage.publicUrl(row.media_key),
+      isMine: true, createdAt: row.createdAt,
+    });
+  } catch (err) {
+    // Don't strand the uploaded object if the insert fails.
+    if (mediaKey) storage.remove(mediaKey).catch(() => {});
+    throw err;
+  }
+}));
+
+// DELETE /playbook/:id — author only; also removes the stored media object.
+playbook.delete('/:id', validate({ params: z.object({ id: z.string().uuid() }) }), asyncH(async (req, res) => {
   const { rows: [row] } = await db.query(
-    `INSERT INTO playbook_items (author_id, sport_id, team_id, league_id, kind, title, description, tags)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-     RETURNING id, kind, title, description, tags, created_at AS "createdAt"`,
-    [req.user.id, b.sportId || null, b.teamId || null, b.leagueId || null, b.kind, b.title, b.description || null, b.tags]);
-  created(res, row);
+    'DELETE FROM playbook_items WHERE id=$1 AND author_id=$2 RETURNING media_key', [req.params.id, req.user.id]);
+  if (!row) throw ApiError.notFound('Playbook item not found');
+  if (row.media_key) storage.remove(row.media_key).catch(() => {});
+  ok(res, { deleted: true });
 }));
 
 // ================================================================ DUGOUT (chat)

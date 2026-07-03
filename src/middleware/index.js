@@ -77,8 +77,9 @@ const errorHandler = (err, req, res, _next) => {
   });
 };
 
-const notFound = (_req, res) => res.status(404).json({
-  success: false, error: { code: 'NOT_FOUND', message: 'Route not found' },
+const notFound = (req, res) => res.status(404).json({
+  success: false,
+  error: { code: 'NOT_FOUND', message: `Route not found: ${req.method} ${req.originalUrl}` },
 });
 
 module.exports = { authenticate, requireRole, validate, errorHandler, notFound };

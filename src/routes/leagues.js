@@ -255,7 +255,9 @@ router.get('/:id/code', requireRole('COACH'), validate({ params: uuid }), asyncH
     `SELECT code, use_count AS "useCount", max_uses AS "maxUses", expires_at AS "expiresAt", created_at AS "createdAt"
      FROM league_codes WHERE league_id=$1 AND is_active ORDER BY created_at DESC LIMIT 1`, [req.params.id]);
   if (!code) throw ApiError.notFound('No active code — rotate to create one');
-  ok(res, code);
+  // `leagueCode` mirrors the field name used in the create-league response so
+  // clients can rely on one name everywhere.
+  ok(res, { ...code, leagueCode: code.code });
 }));
 
 // POST /leagues/:id/code/rotate — revoke current, issue new (revocable codes)
