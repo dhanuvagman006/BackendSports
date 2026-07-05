@@ -24,10 +24,32 @@ app.use(express.json({ limit: '1mb' }));
 app.use(pinoHttp({ autoLogging: config.env === 'production' }));
 
 // Locally stored uploads (dev fallback when S3/MinIO is not running).
-app.use('/uploads', express.static(require('./services/storage').LOCAL_DIR, {
+const storage = require('./services/storage');
+app.use('/uploads', express.static(storage.LOCAL_DIR, {
   maxAge: '7d',
   immutable: true,
 }));
+
+// Objects stored in S3/MinIO are streamed through the API, so clients only
+// ever need the API host they already talk to. (Presigned URLs pointed at
+// the Docker-internal http://minio:9000, which phones cannot resolve — the
+// avatar uploaded fine but never displayed.) Keys are content-addressed
+// UUIDs, so aggressive immutable caching is safe.
+app.get('/uploads/*', async (req, res, next) => {
+  try {
+    const key = decodeURIComponent(req.params[0] || '');
+    if (!key || key.includes('..')) return next();
+    const obj = await storage.fetchObject(key);
+    if (!obj || !obj.Body) return next();
+    res.set('Content-Type', obj.ContentType || 'application/octet-stream');
+    if (obj.ContentLength != null) res.set('Content-Length', String(obj.ContentLength));
+    res.set('Cache-Control', 'public, max-age=604800, immutable');
+    obj.Body.on('error', () => res.destroy());
+    obj.Body.pipe(res);
+  } catch {
+    next();
+  }
+});
 
 // throttle auth endpoints against credential stuffing / OTP brute force
 app.use('/auth', rateLimit({ windowMs: 15 * 60 * 1000, max: 50, standardHeaders: true }));

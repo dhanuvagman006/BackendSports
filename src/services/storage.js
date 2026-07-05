@@ -1,5 +1,4 @@
 const { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
-const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const crypto = require('crypto');
 const fs = require('fs/promises');
 const path = require('path');
@@ -68,17 +67,30 @@ async function remove(key) {
 
 /**
  * Public URL for a key.
- * - Locally stored files return a RELATIVE url ("/uploads/<key>"); clients
- *   resolve it against the API base URL they already use, so it works from
- *   emulators and real devices alike.
- * - Otherwise the configured CDN base is used, falling back to a 24h
- *   presigned S3 URL.
+ * - With a CDN configured (S3_PUBLIC_BASE_URL) that base is used.
+ * - Otherwise a RELATIVE url ("/uploads/<key>") is returned; clients resolve
+ *   it against the API base URL they already use. The API serves the file
+ *   from local disk or proxies it from S3/MinIO (see the /uploads route).
+ *   Presigned URLs are deliberately NOT used here: in Docker they are built
+ *   on the internal endpoint (http://minio:9000), a hostname phones cannot
+ *   resolve — avatars uploaded fine but never displayed.
  */
 async function publicUrl(key) {
   if (!key) return null;
-  if (await localExists(key)) return `/uploads/${key}`;
   if (config.storage.publicBaseUrl) return `${config.storage.publicBaseUrl}/${key}`;
-  return getSignedUrl(s3, new GetObjectCommand({ Bucket: config.storage.bucket, Key: key }), { expiresIn: 86400 });
+  return `/uploads/${key}`;
 }
 
-module.exports = { upload, remove, publicUrl, LOCAL_DIR };
+/**
+ * Fetch an object from S3/MinIO for proxying; returns null when the object
+ * (or the object store itself) is unavailable.
+ */
+async function fetchObject(key) {
+  try {
+    return await s3.send(new GetObjectCommand({ Bucket: config.storage.bucket, Key: key }));
+  } catch {
+    return null;
+  }
+}
+
+module.exports = { upload, remove, publicUrl, fetchObject, LOCAL_DIR };
