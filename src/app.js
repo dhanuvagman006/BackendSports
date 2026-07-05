@@ -32,7 +32,11 @@ app.use('/uploads', express.static(require('./services/storage').LOCAL_DIR, {
 // throttle auth endpoints against credential stuffing / OTP brute force
 app.use('/auth', rateLimit({ windowMs: 15 * 60 * 1000, max: 50, standardHeaders: true }));
 
-app.get('/health', (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
+// Version comes from package.json so a quick `curl /health` reveals whether
+// the running container is a stale build (the cause of "Route not found"
+// errors in the app after the code has moved on).
+const { version } = require('../package.json');
+app.get('/health', (_req, res) => res.json({ ok: true, version, ts: new Date().toISOString() }));
 
 app.use('/auth', authRoutes);
 app.use('/me', meRouter);

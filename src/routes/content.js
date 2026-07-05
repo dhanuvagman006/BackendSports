@@ -12,11 +12,23 @@ const VIDEO_RE = /^video\/(mp4|quicktime|webm|3gpp|x-msvideo)$/;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_VIDEO_BYTES = 100 * 1024 * 1024;
 
+// Extension fallback for clients that send a generic mimetype
+// (Flutter's http package defaults to application/octet-stream).
+const EXT_TO_MIME = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif',
+  mp4: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm', '3gp': 'video/3gpp', avi: 'video/x-msvideo',
+};
 const mediaUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: MAX_VIDEO_BYTES },
   fileFilter: (_req, file, cb) => {
     if (IMAGE_RE.test(file.mimetype) || VIDEO_RE.test(file.mimetype)) return cb(null, true);
+    const generic = !file.mimetype || file.mimetype === 'application/octet-stream';
+    const ext = ((file.originalname || '').split('.').pop() || '').toLowerCase();
+    if (generic && EXT_TO_MIME[ext]) {
+      file.mimetype = EXT_TO_MIME[ext]; // normalize for storage Content-Type
+      return cb(null, true);
+    }
     cb(ApiError.badRequest('Only PNG/JPG/WEBP/GIF images or MP4/MOV/WEBM videos are allowed'));
   },
 });

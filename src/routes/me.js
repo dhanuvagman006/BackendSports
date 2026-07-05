@@ -7,11 +7,26 @@ const { ok, asyncH, ApiError } = require('../utils/http');
 const { authenticate, validate } = require('../middleware');
 
 const router = express.Router();
+// Accept by MIME type, but fall back to the file extension when the client
+// sends a generic type. Flutter's http package labels files
+// "application/octet-stream" unless a contentType is set explicitly, so
+// avatar uploads from older app builds were rejected here even though the
+// file itself was a perfectly valid JPG/PNG.
+const AVATAR_MIME_RE = /^image\/(png|jpe?g|webp)$/;
+const AVATAR_EXT_RE = /\.(png|jpe?g|webp)$/i;
 const uploadMw = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    if (/^image\/(png|jpe?g|webp)$/.test(file.mimetype)) return cb(null, true);
+    if (AVATAR_MIME_RE.test(file.mimetype)) return cb(null, true);
+    const generic = !file.mimetype || file.mimetype === 'application/octet-stream';
+    const ext = (file.originalname || '').match(AVATAR_EXT_RE);
+    if (generic && ext) {
+      // Normalize so the stored object is served with a real image type.
+      const e = ext[1].toLowerCase();
+      file.mimetype = `image/${e === 'jpg' ? 'jpeg' : e}`;
+      return cb(null, true);
+    }
     cb(ApiError.badRequest('Only PNG, JPG or WEBP images are allowed'));
   },
 });
