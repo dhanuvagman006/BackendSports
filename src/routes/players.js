@@ -57,6 +57,7 @@ router.get('/discover', asyncH(async (req, res) => {
             s.name AS sport, s.emoji AS "sportEmoji",
             (SELECT COUNT(*) FROM follows f WHERE f.followee_id = pp.user_id) AS followers,
             EXISTS(SELECT 1 FROM follows f2 WHERE f2.follower_id = $${meIdx} AND f2.followee_id = pp.user_id) AS "isFollowing",
+            EXISTS(SELECT 1 FROM recommendations rc WHERE rc.from_coach_id = $${meIdx} AND rc.player_id = pp.user_id) AS "isRecommended",
             (SELECT COUNT(*) FROM player_stats ps WHERE ps.player_id = pp.user_id) AS "matchesPlayed",
             COUNT(*) OVER() AS total
      FROM player_profiles pp
@@ -82,6 +83,7 @@ router.get('/discover', asyncH(async (req, res) => {
       sportEmoji: r.sportEmoji,
       followers: Number(r.followers),
       isFollowing: r.isFollowing === true,
+      isRecommended: r.isRecommended === true,
       matchesPlayed: Number(r.matchesPlayed),
     });
   }
@@ -105,6 +107,7 @@ router.get('/', requireRole('COACH'), asyncH(async (req, res) => {
             t.name AS "teamName", trm.position, trm.status AS roster_status,
             lm.joined_at AS "joinedAt",
             EXISTS(SELECT 1 FROM follows f WHERE f.follower_id = $1 AND f.followee_id = pp.user_id) AS "isFollowing",
+            EXISTS(SELECT 1 FROM recommendations rc WHERE rc.from_coach_id = $1 AND rc.player_id = pp.user_id) AS "isRecommended",
             (SELECT COUNT(*) FROM follows f2 WHERE f2.followee_id = pp.user_id) AS followers,
             COUNT(*) OVER() AS total
      FROM player_profiles pp
@@ -125,6 +128,7 @@ router.get('/', requireRole('COACH'), asyncH(async (req, res) => {
     teamName: r.teamName, position: r.position,
     onTeam: r.roster_status === 'ACTIVE',
     isFollowing: r.isFollowing === true,
+    isRecommended: r.isRecommended === true,
     followers: Number(r.followers || 0),
     joinedAt: r.joinedAt,
   })));
@@ -326,6 +330,45 @@ router.post('/:id/follow', validate({ params: uuid }), asyncH(async (req, res) =
 router.delete('/:id/follow', validate({ params: uuid }), asyncH(async (req, res) => {
   await db.query('DELETE FROM follows WHERE follower_id=$1 AND followee_id=$2', [req.user.id, req.params.id]);
   ok(res, { following: false });
+}));
+
+// ---------------------------------------------------------------- POST /players/:id/recommend
+// "Recommend Players": a coach recommends a player to clubs & leagues.
+// Recorded in `recommendations` (one row per coach/player pair; repeat calls
+// refresh it) and the player is notified the first time a given coach
+// recommends them.
+router.post('/:id/recommend', requireRole('COACH'), validate({
+  params: uuid,
+  body: z.object({ note: z.string().max(300).optional() }).optional(),
+}), asyncH(async (req, res) => {
+  const playerId = req.params.id;
+  const { rows: [player] } = await db.query(
+    'SELECT full_name FROM player_profiles WHERE user_id=$1', [playerId]);
+  if (!player) throw ApiError.notFound('Player not found');
+  const { rows: [coach] } = await db.query(
+    'SELECT full_name FROM coach_profiles WHERE user_id=$1', [req.user.id]);
+
+  // `text` is what the player profile screen shows under "Recommendations".
+  const text = (req.body?.note || '').trim()
+    || `Recommended to clubs & leagues by Coach ${coach?.full_name || ''}`.trim();
+
+  const { rows: [rec] } = await db.query(
+    `INSERT INTO recommendations (player_id, from_coach_id, text) VALUES ($1,$2,$3)
+     ON CONFLICT (player_id, from_coach_id)
+       DO UPDATE SET text = EXCLUDED.text, created_at = now()
+     RETURNING (xmax = 0) AS inserted`, [playerId, req.user.id, text]);
+
+  if (rec.inserted) {
+    await db.query(
+      `INSERT INTO notifications (user_id, type, title, body, emoji, data)
+       VALUES ($1,'SOCIAL',$2,$3,$4,$5)`,
+      [playerId,
+       'You got recommended! 🌟',
+       `Coach ${coach?.full_name || 'A coach'} recommended you to clubs & leagues.`,
+       '🌟',
+       JSON.stringify({ kind: 'RECOMMENDATION', coachId: req.user.id })]);
+  }
+  ok(res, { recommended: true, alreadyRecommended: !rec.inserted });
 }));
 
 module.exports = router;
