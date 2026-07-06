@@ -304,6 +304,7 @@ router.get('/:id/performance', validate({ params: uuid }), asyncH(async (req, re
       opponent: `vs ${r.opponent}`,   // matches the 'vs Thunder Strikers' card
       playedAt: r.playedAt,
       resultSummary: r.resultSummary,
+      teamName: r.teamName,           // lets the app tell a win from a loss
       stats: r.stats,                 // {"runs":78,"wickets":1,...}
       qoPoints: r.qoPoints,
       rating: r.rating,
