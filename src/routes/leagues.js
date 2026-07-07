@@ -20,6 +20,7 @@ const uploadMw = multer({
 const uuid = z.object({ id: z.string().uuid() });
 
 const genderMap = { "Men's": 'MENS', "Women's": 'WOMENS', Mixed: 'MIXED', MENS: 'MENS', WOMENS: 'WOMENS', MIXED: 'MIXED' };
+const leagueTypeMap = { Gully: 'GULLY', Professional: 'PROFESSIONAL', GULLY: 'GULLY', PROFESSIONAL: 'PROFESSIONAL' };
 
 async function assertLeagueOwner(leagueId, coachId) {
   const { rows: [l] } = await db.query('SELECT id, owner_coach_id FROM leagues WHERE id=$1', [leagueId]);
@@ -46,6 +47,7 @@ const createLeagueSchema = z.object({
   name: z.string().min(3).max(100),
   location: z.string().max(120).optional(),
   gender: z.string().transform((g) => genderMap[g] || 'MENS'),
+  leagueType: z.string().transform((t) => leagueTypeMap[t] || null).nullable().optional(),
   sportId: z.string().uuid(),
   iconEmoji: z.string().max(8).optional(),
   season: z.string().max(60).optional(),
@@ -65,10 +67,10 @@ router.post('/', requireRole('COACH'), uploadMw.any(), asyncH(async (req, res) =
 
   const result = await db.tx(async (c) => {
     const { rows: [league] } = await c.query(
-      `INSERT INTO leagues (owner_coach_id, sport_id, name, location, gender, icon_emoji, logo_key, season)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      `INSERT INTO leagues (owner_coach_id, sport_id, name, location, gender, league_type, icon_emoji, logo_key, season)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
       [req.user.id, payload.sportId, payload.name, payload.location || null,
-       payload.gender, payload.iconEmoji || null, logoKey, payload.season || null],
+       payload.gender, payload.leagueType || null, payload.iconEmoji || null, logoKey, payload.season || null],
     );
 
     const teams = [];
@@ -92,6 +94,7 @@ router.post('/', requireRole('COACH'), uploadMw.any(), asyncH(async (req, res) =
     name: result.league.name,
     location: result.league.location,
     gender: result.league.gender,
+    leagueType: result.league.league_type,   // GULLY | PROFESSIONAL | null
     icon: result.league.icon_emoji,
     logoUrl: await storage.publicUrl(result.league.logo_key),
     season: result.league.season,
@@ -169,6 +172,7 @@ router.get('/:id', validate({ params: uuid }), asyncH(async (req, res) => {
     name: l.name,
     location: l.location,
     gender: l.gender,
+    leagueType: l.league_type,
     icon: l.icon_emoji,
     logoUrl: await storage.publicUrl(l.logo_key),
     season: l.season,
@@ -307,6 +311,7 @@ router.get('/', asyncH(async (req, res) => {
 
   const data = await Promise.all(rows.map(async (l) => ({
     id: l.id, name: l.name, location: l.location, gender: l.gender,
+    leagueType: l.league_type,
     icon: l.icon_emoji, sportEmoji: l.sport_emoji,
     logoUrl: await storage.publicUrl(l.logo_key),
     status: l.status, season: l.season,
